@@ -5,6 +5,7 @@ from broker.redis_client import RedisClient
 from jobs.base_job import BaseJob, JobResult
 from jobs.ml_training_job import MLTrainingJob
 from jobs.image_resize_job import ImageResizeJob
+import json
 
 logger = logging.getLogger(__name__)
 LOCK_TTL = 30 
@@ -79,6 +80,13 @@ class Worker:
 
             if result.success:
                 logger.info("Job %s completed in %.2fs", job.job_id, result.duration_seconds)
+                await client.lpush("jobs:completed", json.dumps({
+                    "job_id": job.job_id,
+                    "type": job_data.get("type"),
+                    "duration": result.duration_seconds,
+                    "co2_grams": result.co2_grams,
+                }))
+                
             else:
                 logger.error("Job %s failed: %s", job.job_id, result.error)
 
