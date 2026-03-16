@@ -1,0 +1,6 @@
+.env
+energy_env/
+__pycache__/
+*.pyc
+.pytest_cache/
+#source energy_env/bin/activate

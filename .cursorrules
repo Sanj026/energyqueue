@@ -1,0 +1,31 @@
+# EnergyQueue — Cursor Rules
+
+## Project
+A carbon-aware distributed task queue in Python. Schedules ML training jobs based on real-time electricity grid carbon intensity.
+
+## Stack
+- Python 3.11+
+- Redis (via redis-py, async)
+- AsyncIO for concurrency
+- PyTorch + CIFAR-10 for ML jobs
+- CodeCarbon for energy measurement
+- Electricity Maps API for carbon data
+- Streamlit for dashboard
+- Docker + Docker Compose
+- Pytest for testing
+
+## Code Style Rules
+- Always use async/await — never blocking calls
+- Type hints on every function (def foo(x: int) -> str:)
+- Docstrings on every class and function
+- No print() statements — use Python logging module
+- Constants in UPPER_CASE at top of file
+- Keep functions small — one job per function
+- Raise specific exceptions, never bare `except:`
+
+## What NOT to do
+- Do not use Celery — we are building our own queue
+- Do not use threading — use asyncio only
+- Do not hardcode Redis URLs — use environment variables
+- Do not generate frontend code unless asked
+- Do not install packages not in requirements.txt
