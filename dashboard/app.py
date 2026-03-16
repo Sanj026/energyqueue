@@ -6,7 +6,12 @@ from typing import Any, Optional
 
 import altair as alt
 import redis.asyncio as redis
+import requests
 import streamlit as st
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,31 @@ async def _safe_float(client: redis.Redis, key: str) -> Optional[float]:
     except Exception:
         logger.exception("Failed reading float key %s", key)
         return None
+
+
+async def _fetch_live_carbon_intensity() -> Optional[float]:
+    """Fetch current carbon intensity from Electricity Maps API."""
+    api_key = os.getenv("ELECTRICITY_MAPS_API_KEY", "")
+    if not api_key:
+        logger.warning("ELECTRICITY_MAPS_API_KEY is not set; showing N/A for carbon intensity")
+        return None
+
+    url = "https://api.electricitymap.org/v3/carbon-intensity/latest"
+    params = {"zone": DEFAULT_GRID_ZONE}
+    headers = {"auth-token": api_key}
+
+    def _do_request() -> Optional[float]:
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=5)
+            response.raise_for_status()
+            data: Any = response.json()
+            value = data.get("carbonIntensity")
+            return float(value) if value is not None else None
+        except Exception as exc:
+            logger.warning("Carbon API request failed: %s", str(exc))
+            return None
+
+    return await asyncio.to_thread(_do_request)
 
 
 async def _fetch_snapshot(client: redis.Redis) -> DashboardSnapshot:
@@ -235,7 +265,7 @@ async def _render_once(
 
     with carbon_box.container():
         st.subheader("2) Current carbon intensity (GB)")
-        intensity = snapshot.carbon_intensity_g_per_kwh
+        intensity = await _fetch_live_carbon_intensity()
         color = _carbon_color(intensity)
         label = "N/A" if intensity is None else f"{intensity:.0f} gCO₂/kWh"
         st.metric(label="Carbon intensity", value=label)
