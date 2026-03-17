@@ -2,7 +2,7 @@
 
 ---
 
-### 1. One-line pitch
+
 
 **EnergyQueue is a carbon-aware distributed task queue that schedules ML training jobs based on real-time grid carbon intensity.**
 
