@@ -28,7 +28,7 @@ ENERGY_BUDGET_CONSUMED_KEY = "energy:budget:consumed"
 DEFAULT_ENERGY_BUDGET_GRAMS = 500.0
 
 COMPLETED_JOBS_KEY = "jobs:completed"
-SCHEDULER_DECISION_LABELS = ("RUN", "DEFER", "THROTTLE", "STOP")
+SCHEDULER_DECISION_LABELS = ("RUN", "DEFER", "THROTTLE", "STOP", "UNKNOWN")
 
 
 @dataclass(frozen=True)
@@ -78,13 +78,12 @@ def _scheduler_decision(
     if budget_exhausted:
         return "STOP"
     if carbon_intensity is None:
-        return "DEFER"
-
-    if carbon_intensity > carbon_threshold * 1.5:
-        return "DEFER"
-    if carbon_intensity > carbon_threshold:
+        return "UNKNOWN"
+    if carbon_intensity < 150:
+        return "RUN"
+    if carbon_intensity < 250:
         return "THROTTLE"
-    return "RUN"
+    return "DEFER"
 
 
 async def _connect_redis(redis_url: str) -> redis.Redis:
@@ -160,11 +159,7 @@ async def _fetch_snapshot(client: redis.Redis) -> DashboardSnapshot:
     consumed_grams = float(consumed) if consumed is not None else 0.0
     budget_exhausted = consumed_grams >= budget_total
 
-    decision = _scheduler_decision(
-        carbon_intensity=carbon_intensity,
-        carbon_threshold=carbon_threshold,
-        budget_exhausted=budget_exhausted,
-    )
+    decision = "UNKNOWN"
 
     try:
         completed = await client.lrange(COMPLETED_JOBS_KEY, -10, -1)
@@ -214,10 +209,11 @@ def _queue_depth_chart(snapshot: DashboardSnapshot) -> alt.Chart:
 def _decision_badge(decision: str) -> str:
     """Render a simple HTML badge for scheduler decision."""
     color_map = {
-        "RUN": "#2e7d32",
-        "DEFER": "#ff4b4b",
-        "THROTTLE": "#ffa500",
-        "STOP": "#6b7280",
+        "RUN": "#16a34a",        # green
+        "THROTTLE": "#f97316",   # orange
+        "DEFER": "#ef4444",      # red
+        "STOP": "#991b1b",       # dark red
+        "UNKNOWN": "#6b7280",    # grey
     }
     bg = color_map.get(decision, "#6b7280")
     return (
@@ -255,17 +251,56 @@ async def _render_once(
         except Exception:
             logger.exception("Failed closing Redis client")
 
+    live_intensity = await _fetch_live_carbon_intensity()
+
+    budget_exhausted = snapshot.energy_consumed_grams >= snapshot.energy_budget_total_grams
+    if budget_exhausted:
+        decision = "STOP"
+    elif live_intensity is None:
+        decision = "UNKNOWN"
+    elif live_intensity < 150:
+        decision = "RUN"
+    elif live_intensity < 250:
+        decision = "THROTTLE"
+    else:
+        decision = "DEFER"
+
     with header_box.container():
-        st.title("EnergyQueue Dashboard")
-        st.caption(f"Auto-refreshing every {REFRESH_SECONDS}s")
+        st.markdown(
+            "<div style='display:flex;justify-content:space-between;align-items:flex-end;'>"
+            "<div>"
+            "<h2 style='margin-bottom:0;'>EnergyQueue Operations Console</h2>"
+            "<p style='margin-top:4px;color:gray;'>Carbon-aware task queue — live grid & energy telemetry.</p>"
+            "</div>"
+            f"<div style='font-size:12px;color:gray;'>Auto-refresh: {REFRESH_SECONDS}s</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        total_queued = (
+            snapshot.queue_depth_high + snapshot.queue_depth_medium + snapshot.queue_depth_low
+        )
+        budget_used_pct = (
+            0.0
+            if snapshot.energy_budget_total_grams <= 0
+            else min(100.0, (snapshot.energy_consumed_grams / snapshot.energy_budget_total_grams) * 100.0)
+        )
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Queued jobs (all lanes)", value=total_queued)
+        with col_b:
+            label = "N/A" if live_intensity is None else f"{live_intensity:.0f} gCO₂/kWh"
+            st.metric("Live carbon intensity", value=label)
+        with col_c:
+            st.metric("Energy budget used", value=f"{budget_used_pct:.1f}%")
 
     with queue_box.container():
         st.subheader("1) Queue depth")
         st.altair_chart(_queue_depth_chart(snapshot), use_container_width=True)
+        st.caption("HIGH = urgent jobs, MEDIUM = normal, LOW = background tasks")
 
     with carbon_box.container():
         st.subheader("2) Current carbon intensity (GB)")
-        intensity = await _fetch_live_carbon_intensity()
+        intensity = live_intensity
         color = _carbon_color(intensity)
         label = "N/A" if intensity is None else f"{intensity:.0f} gCO₂/kWh"
         st.metric(label="Carbon intensity", value=label)
@@ -275,6 +310,11 @@ async def _render_once(
             "</div>",
             unsafe_allow_html=True,
         )
+        st.markdown(
+            "🟢 **GREEN < 150g** — grid is clean, all jobs run  \n"
+            "🟡 **ORANGE 150–250g** — grid is moderate, LOW jobs deferred  \n"
+            "🔴 **RED > 250g** — grid is dirty, only HIGH jobs run",
+        )
 
     with budget_box.container():
         st.subheader("3) Energy budget")
@@ -283,11 +323,20 @@ async def _render_once(
         pct = 0.0 if total <= 0 else min(1.0, consumed / total)
         st.progress(pct)
         st.caption(f"{consumed:.1f} gCO₂ used / {total:.1f} gCO₂ total")
+        st.caption(
+            "Session budget: 500g CO₂ total. Equivalent to ~2.5km driven in a petrol car."
+        )
 
     with decision_box.container():
         st.subheader("4) Scheduler decision")
-        st.markdown(_decision_badge(snapshot.scheduler_decision), unsafe_allow_html=True)
+        st.markdown(_decision_badge(decision), unsafe_allow_html=True)
         st.caption("Derived from carbon intensity + remaining budget.")
+        st.markdown(
+            "RUN = grid clean, all jobs processing normally  \n"
+            "DEFER = grid too dirty, jobs waiting for cleaner energy  \n"
+            "THROTTLE = grid moderate, low priority jobs paused  \n"
+            "STOP = energy budget exhausted for this session",
+        )
 
     with completed_box.container():
         st.subheader("5) Last 10 completed jobs")
