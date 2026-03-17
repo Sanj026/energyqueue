@@ -7,7 +7,8 @@ from scheduler.energy_budget import EnergyBudget
 
 logger = logging.getLogger(__name__)
 
-CARBON_THRESHOLD = float(os.getenv("CARBON_THRESHOLD", 200))
+CARBON_RUN_THRESHOLD = float(os.getenv("CARBON_RUN_THRESHOLD", 150))
+CARBON_THROTTLE_THRESHOLD = float(os.getenv("CARBON_THROTTLE_THRESHOLD", 250))
 GRID_ZONE = os.getenv("GRID_ZONE", "GB")
 
 
@@ -45,28 +46,28 @@ class Scheduler:
         # Check 3 — is it a high priority job?
         job_priority = job.get("priority", Priority.MEDIUM.name)
 
-        if intensity > CARBON_THRESHOLD * 1.5:
-            # Grid is very dirty — only run HIGH priority
+        if intensity >= CARBON_THROTTLE_THRESHOLD:
+            # Grid is dirty — only run HIGH priority
             if job_priority == Priority.HIGH.name:
-                logger.info("Grid very dirty (%.0fg) but job is HIGH priority — running", intensity)
+                logger.info("Grid dirty (%.0fg) but job is HIGH priority — running", intensity)
                 return SchedulingDecision.RUN
-            logger.info("Grid very dirty (%.0fg) — deferring %s job", intensity, job_priority)
+            logger.info("Grid dirty (%.0fg) — deferring %s job", intensity, job_priority)
             return SchedulingDecision.DEFER
 
-        elif intensity > CARBON_THRESHOLD:
-            # Grid is dirty — run HIGH and MEDIUM, defer LOW
+        if intensity >= CARBON_RUN_THRESHOLD:
+            # Grid is moderate — throttle; defer LOW
             if job_priority == Priority.LOW.name:
-                logger.info("Grid dirty (%.0fg) — deferring LOW priority job", intensity)
+                logger.info("Grid moderate (%.0fg) — deferring LOW priority job", intensity)
                 return SchedulingDecision.DEFER
+            logger.info("Grid moderate (%.0fg) — throttling", intensity)
             return SchedulingDecision.THROTTLE
 
-        else:
-            # Grid is clean — run everything
-            logger.info("Grid clean (%.0fg) — running job", intensity)
-            return SchedulingDecision.RUN
+        # Grid is clean — run everything
+        logger.info("Grid clean (%.0fg) — running job", intensity)
+        return SchedulingDecision.RUN
 
     async def should_flush_deferred(self) -> bool:
         """Return True if conditions are good enough to run deferred jobs."""
         intensity = await self.carbon.get_carbon_intensity(GRID_ZONE)
         budget_ok = not await self.budget.is_exhausted()
-        return intensity <= CARBON_THRESHOLD and budget_ok
+        return intensity < CARBON_RUN_THRESHOLD and budget_ok
