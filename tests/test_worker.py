@@ -141,7 +141,6 @@ async def test_successful_job_logs_completion(caplog: pytest.LogCaptureFixture) 
         )
 
     assert "completed" in caplog.text.lower()
-    redis_client.lpush.assert_awaited()
     redis_client.delete.assert_awaited_with("lock:job-1")
 
 

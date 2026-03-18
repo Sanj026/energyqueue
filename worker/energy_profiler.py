@@ -1,9 +1,12 @@
 import json
 import logging
 import time
-from typing import Awaitable, Callable, Optional, TypeVar
+from typing import Any, Awaitable, Optional, TypeVar
 
-from codecarbon import EmissionsTracker
+try:
+    from codecarbon import EmissionsTracker  # type: ignore
+except Exception:  # pragma: no cover - optional dependency may be unavailable
+    EmissionsTracker = None  # type: ignore[assignment]
 
 from broker.redis_client import RedisClient
 from jobs.base_job import BaseJob, JobResult
@@ -41,30 +44,38 @@ class EnergyProfiler:
     async def run(self, awaitable: Awaitable[T]) -> T:
         """Measure energy/emissions while awaiting an awaitable."""
         start = time.perf_counter()
-        tracker = EmissionsTracker(
-            measure_power_secs=1,
-            log_level="error",
-            save_to_file=False,
-        )
-
-        tracker.start()
+        tracker: Any = None
+        if EmissionsTracker is not None:
+            try:
+                tracker = EmissionsTracker(
+                    measure_power_secs=1,
+                    log_level="error",
+                    save_to_file=False,
+                )
+                tracker.start()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Energy tracking disabled (CodeCarbon init failed): %s", str(exc))
+                tracker = None
         try:
             value = await awaitable
         finally:
-            try:
-                emissions_kg: Optional[float] = tracker.stop()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("EmissionsTracker.stop() failed: %s", str(exc))
-                emissions_kg = None
+            emissions_kg: Optional[float] = None
+            if tracker is not None:
+                try:
+                    emissions_kg = tracker.stop()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("EmissionsTracker.stop() failed: %s", str(exc))
+                    emissions_kg = None
 
         duration = time.perf_counter() - start
 
         measured_energy_kwh: Optional[float] = None
-        try:
-            total_energy = getattr(tracker, "_total_energy", None)
-            measured_energy_kwh = getattr(total_energy, "kwh", None)
-        except Exception:  # pragma: no cover - internal structure may change
-            measured_energy_kwh = None
+        if tracker is not None:
+            try:
+                total_energy = getattr(tracker, "_total_energy", None)
+                measured_energy_kwh = getattr(total_energy, "kwh", None)
+            except Exception:  # pragma: no cover - internal structure may change
+                measured_energy_kwh = None
 
         if isinstance(value, JobResult):
             energy_kwh = float(measured_energy_kwh) if measured_energy_kwh is not None else float(value.energy_kwh)
@@ -88,33 +99,47 @@ class EnergyProfiler:
         updated from CodeCarbon measurements when available.
         """
         start = time.perf_counter()
-        tracker = EmissionsTracker(
-            measure_power_secs=1,
-            log_level="error",
-            save_to_file=False,
-        )
+        tracker: Any = None
+        if EmissionsTracker is not None:
+            try:
+                tracker = EmissionsTracker(
+                    measure_power_secs=1,
+                    log_level="error",
+                    save_to_file=False,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Energy tracking disabled (CodeCarbon init failed): %s", str(exc))
+                tracker = None
 
         logger.info("Starting energy profiling for job %s (%s)", job.job_id, job_type)
 
-        tracker.start()
+        if tracker is not None:
+            try:
+                tracker.start()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Energy tracking disabled (CodeCarbon start failed): %s", str(exc))
+                tracker = None
         result: JobResult
         try:
             result = await job.execute()
         finally:
-            try:
-                emissions_kg: Optional[float] = tracker.stop()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("EmissionsTracker.stop() failed: %s", str(exc))
-                emissions_kg = None
+            emissions_kg: Optional[float] = None
+            if tracker is not None:
+                try:
+                    emissions_kg = tracker.stop()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("EmissionsTracker.stop() failed: %s", str(exc))
+                    emissions_kg = None
 
         duration = time.perf_counter() - start
 
         measured_energy_kwh: Optional[float] = None
-        try:
-            total_energy = getattr(tracker, "_total_energy", None)
-            measured_energy_kwh = getattr(total_energy, "kwh", None)
-        except Exception:  # pragma: no cover - internal structure may change
-            measured_energy_kwh = None
+        if tracker is not None:
+            try:
+                total_energy = getattr(tracker, "_total_energy", None)
+                measured_energy_kwh = getattr(total_energy, "kwh", None)
+            except Exception:  # pragma: no cover - internal structure may change
+                measured_energy_kwh = None
 
         energy_kwh = float(measured_energy_kwh) if measured_energy_kwh is not None else result.energy_kwh
         co2_grams = (
