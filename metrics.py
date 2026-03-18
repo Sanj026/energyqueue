@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 from typing import Optional
 
+import requests
 from prometheus_client import Gauge, start_http_server
 
 from broker.redis_client import RedisClient
@@ -49,7 +51,21 @@ async def _update_metrics(redis_client: RedisClient) -> None:
     CO2_CONSUMED_GRAMS.set(_safe_float(consumed_raw))
 
     intensity_raw = await client.get("cache:carbon_intensity:GB")
-    CARBON_INTENSITY_GCO2_KWH.set(_safe_float(intensity_raw))
+    intensity = _safe_float(intensity_raw)
+
+    if intensity == 0.0:
+        try:
+            url = "https://api.electricitymap.org/v3/carbon-intensity/latest?zone=GB"
+            headers = {"auth-token": os.getenv("ELECTRICITY_MAPS_API_KEY", "")}
+            response = requests.get(url, headers=headers, timeout=5)
+            response.raise_for_status()
+            intensity = float(response.json()["carbonIntensity"])
+            await client.set("cache:carbon_intensity:GB", str(intensity), ex=300)
+            logger.info("Fetched carbon intensity from API: %.2f gCO2/kWh", intensity)
+        except Exception:
+            logger.exception("Failed to fetch carbon intensity from Electricity Maps API")
+
+    CARBON_INTENSITY_GCO2_KWH.set(intensity)
 
 
 async def main() -> None:

@@ -40,6 +40,8 @@ services:
       - REDIS_URL=redis://redis:6379
       - CARBON_THRESHOLD=200
       - ENERGY_BUDGET_GRAMS=500
+      - ELECTRICITY_MAPS_API_KEY=${ELECTRICITY_MAPS_API_KEY}
+      - GRID_ZONE=GB
     restart: unless-stopped
 
   prometheus:
