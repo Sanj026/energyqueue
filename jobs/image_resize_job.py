@@ -37,9 +37,9 @@ class ImageResizeJob(BaseJob):
             output_path_raw = self.payload.get("output_path")
 
             if not output_path_raw:
-                raise ValueError("output_path must be provided in payload")
-
-            output_path = Path(output_path_raw)
+                output_path = Path(f"/tmp/resized_{self.job_id}.jpg")
+            else:
+                output_path = Path(output_path_raw)
 
             if input_path_raw:
                 input_path = Path(input_path_raw)

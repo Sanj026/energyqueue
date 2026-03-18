@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from codecarbon import EmissionsTracker
 
@@ -9,6 +9,8 @@ from broker.redis_client import RedisClient
 from jobs.base_job import BaseJob, JobResult
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class EnergyProfiler:
@@ -19,9 +21,65 @@ class EnergyProfiler:
     - energy:profile:{job_type}    — aggregated totals per job type
     """
 
-    def __init__(self, redis_client: RedisClient) -> None:
-        """Initialize the profiler with a shared Redis client wrapper."""
+    def __init__(
+        self,
+        redis_client: Optional[RedisClient] = None,
+        *,
+        job_id: Optional[str] = None,
+        job_type: Optional[str] = None,
+    ) -> None:
+        """Initialize the profiler.
+
+        If a Redis client wrapper is provided, aggregated results can be stored
+        via `run_with_profiling`. The lightweight `run` method performs
+        measurement only.
+        """
         self.redis_client = redis_client
+        self.job_id = job_id
+        self.job_type = job_type
+
+    async def run(self, awaitable: Awaitable[T]) -> T:
+        """Measure energy/emissions while awaiting an awaitable."""
+        start = time.perf_counter()
+        tracker = EmissionsTracker(
+            measure_power_secs=1,
+            log_level="error",
+            save_to_file=False,
+        )
+
+        tracker.start()
+        try:
+            value = await awaitable
+        finally:
+            try:
+                emissions_kg: Optional[float] = tracker.stop()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("EmissionsTracker.stop() failed: %s", str(exc))
+                emissions_kg = None
+
+        duration = time.perf_counter() - start
+
+        measured_energy_kwh: Optional[float] = None
+        try:
+            total_energy = getattr(tracker, "_total_energy", None)
+            measured_energy_kwh = getattr(total_energy, "kwh", None)
+        except Exception:  # pragma: no cover - internal structure may change
+            measured_energy_kwh = None
+
+        if isinstance(value, JobResult):
+            energy_kwh = float(measured_energy_kwh) if measured_energy_kwh is not None else float(value.energy_kwh)
+            co2_grams = float(emissions_kg) * 1000.0 if emissions_kg is not None else float(value.co2_grams)
+            return JobResult(
+                job_id=value.job_id,
+                success=value.success,
+                output=value.output,
+                error=value.error,
+                duration_seconds=duration,
+                energy_kwh=energy_kwh,
+                co2_grams=co2_grams,
+            )  # type: ignore[return-value]
+
+        return value
 
     async def run_with_profiling(self, job_type: str, job: BaseJob) -> JobResult:
         """Execute a job while measuring energy and emissions.
@@ -89,6 +147,8 @@ class EnergyProfiler:
 
     async def _store_results(self, job_type: str, result: JobResult) -> None:
         """Persist per-job and aggregated metrics to Redis."""
+        if self.redis_client is None:
+            raise ValueError("redis_client is required to store profiling results")
         client = await self.redis_client.get_client()
 
         job_key = f"energy:{result.job_id}"

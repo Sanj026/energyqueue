@@ -7,4 +7,5 @@ data/
 *.tar.gz
 *.tar
 
-#source energy_env/bin/activate
+#source energy_env/bin/activatelogs/
+logs/
