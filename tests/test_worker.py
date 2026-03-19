@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from jobs.base_job import JobResult
+from scheduler.scheduler import SchedulingDecision
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,13 @@ async def test_unknown_job_type_handled_gracefully(caplog: pytest.LogCaptureFixt
     async def fast_sleep(_: float) -> None:
         await original_sleep(0)
 
-    with patch("worker.worker.asyncio.sleep", new=fast_sleep):
+    with (
+        patch("worker.worker.asyncio.sleep", new=fast_sleep),
+        patch("worker.worker.Scheduler") as mock_scheduler_cls,
+    ):
+        mock_scheduler_cls.return_value.decide = AsyncMock(
+            return_value=SchedulingDecision.RUN
+        )
         await asyncio.wait_for(
             asyncio.gather(worker.start(), stop_after_delay(), return_exceptions=True),
             timeout=1.0,
@@ -134,7 +141,11 @@ async def test_successful_job_logs_completion(caplog: pytest.LogCaptureFixture) 
     with (
         patch("worker.worker.JOB_REGISTRY", new={"fake": _job_factory}),
         patch("worker.worker.asyncio.sleep", new=fast_sleep),
+        patch("worker.worker.Scheduler") as mock_scheduler_cls,
     ):
+        mock_scheduler_cls.return_value.decide = AsyncMock(
+            return_value=SchedulingDecision.RUN
+        )
         await asyncio.wait_for(
             asyncio.gather(worker.start(), stop_after_delay(), return_exceptions=True),
             timeout=1.0,
@@ -185,13 +196,126 @@ async def test_failed_job_logs_error(caplog: pytest.LogCaptureFixture) -> None:
     with (
         patch("worker.worker.JOB_REGISTRY", new={"fake": _job_factory}),
         patch("worker.worker.asyncio.sleep", new=fast_sleep),
+        patch("worker.worker.Scheduler") as mock_scheduler_cls,
     ):
+        mock_scheduler_cls.return_value.decide = AsyncMock(
+            return_value=SchedulingDecision.RUN
+        )
         await asyncio.wait_for(
             asyncio.gather(worker.start(), stop_after_delay(), return_exceptions=True),
             timeout=1.0,
         )
 
     assert "failed" in caplog.text.lower()
+    redis_client.lpush.assert_not_awaited()
+    redis_client.delete.assert_awaited_with("lock:job-1")
+
+
+@pytest.mark.asyncio
+async def test_stop_decision_reenqueues_job_and_skips_execution() -> None:
+    mock_queue = MagicMock()
+    job_data = {"id": "job-1", "type": "fake", "payload": {}, "priority": "MEDIUM"}
+    mock_queue.redis, redis_client = _make_mock_redis()
+
+    success_result = JobResult(
+        job_id="job-1",
+        success=True,
+        output={"ok": True},
+        duration_seconds=0.25,
+        co2_grams=1.0,
+        energy_kwh=0.01,
+    )
+
+    def _job_factory(job_id: str, payload: dict[str, Any]) -> _FakeJob:
+        return _FakeJob(job_id=job_id, payload=payload, result=success_result)
+
+    from worker.worker import Worker
+
+    worker = Worker(worker_id="test-1", queue=mock_queue)
+
+    with (
+        patch("worker.worker.JOB_REGISTRY", new={"fake": _job_factory}),
+        patch("worker.worker.Scheduler") as mock_scheduler_cls,
+    ):
+        mock_scheduler_cls.return_value.decide = AsyncMock(
+            return_value=SchedulingDecision.STOP
+        )
+        await worker._execute_job(job_data)
+
+    redis_client.lpush.assert_awaited_once()
+    args, _ = redis_client.lpush.await_args
+    assert args[0] == "queue:medium"
+    redis_client.delete.assert_awaited_with("lock:job-1")
+
+
+@pytest.mark.asyncio
+async def test_defer_low_priority_reenqueues_with_five_minute_delay() -> None:
+    mock_queue = MagicMock()
+    job_data = {"id": "job-1", "type": "fake", "payload": {}, "priority": "LOW"}
+    mock_queue.redis, redis_client = _make_mock_redis()
+
+    success_result = JobResult(
+        job_id="job-1",
+        success=True,
+        output={"ok": True},
+        duration_seconds=0.25,
+        co2_grams=1.0,
+        energy_kwh=0.01,
+    )
+
+    def _job_factory(job_id: str, payload: dict[str, Any]) -> _FakeJob:
+        return _FakeJob(job_id=job_id, payload=payload, result=success_result)
+
+    from worker.worker import Worker
+
+    worker = Worker(worker_id="test-1", queue=mock_queue)
+
+    with (
+        patch("worker.worker.JOB_REGISTRY", new={"fake": _job_factory}),
+        patch("worker.worker.Scheduler") as mock_scheduler_cls,
+        patch("worker.worker.asyncio.create_task") as mock_create_task,
+    ):
+        mock_scheduler_cls.return_value.decide = AsyncMock(
+            return_value=SchedulingDecision.DEFER
+        )
+        await worker._execute_job(job_data)
+
+    mock_create_task.assert_called_once()
+    redis_client.lpush.assert_not_awaited()
+    redis_client.delete.assert_awaited_with("lock:job-1")
+
+
+@pytest.mark.asyncio
+async def test_throttle_medium_priority_executes_job() -> None:
+    mock_queue = MagicMock()
+    job_data = {"id": "job-1", "type": "fake", "payload": {}, "priority": "MEDIUM"}
+    mock_queue.redis, redis_client = _make_mock_redis()
+
+    success_result = JobResult(
+        job_id="job-1",
+        success=True,
+        output={"ok": True},
+        duration_seconds=0.25,
+        co2_grams=1.0,
+        energy_kwh=0.01,
+    )
+
+    def _job_factory(job_id: str, payload: dict[str, Any]) -> _FakeJob:
+        return _FakeJob(job_id=job_id, payload=payload, result=success_result)
+
+    from worker.worker import Worker
+
+    worker = Worker(worker_id="test-1", queue=mock_queue)
+
+    with (
+        patch("worker.worker.JOB_REGISTRY", new={"fake": _job_factory}),
+        patch("worker.worker.Scheduler") as mock_scheduler_cls,
+    ):
+        mock_scheduler_cls.return_value.decide = AsyncMock(
+            return_value=SchedulingDecision.THROTTLE
+        )
+        await worker._execute_job(job_data)
+
     redis_client.lpush.assert_not_awaited()
     redis_client.delete.assert_awaited_with("lock:job-1")
 

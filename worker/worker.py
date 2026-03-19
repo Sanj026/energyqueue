@@ -7,6 +7,8 @@ from broker.redis_client import RedisClient
 from jobs.base_job import BaseJob, JobResult
 from jobs.ml_training_job import MLTrainingJob
 from jobs.image_resize_job import ImageResizeJob
+from scheduler.scheduler import Scheduler, SchedulingDecision
+from scheduler.carbon_client import CarbonClient
 from scheduler.energy_budget import EnergyBudget
 from worker.energy_profiler import EnergyProfiler
 
@@ -45,6 +47,37 @@ class Worker:
         self.running = False
         logger.info("Worker %s stopping", self.worker_id)
 
+    async def _re_enqueue_job(self, job_data: dict, delay_seconds: int = 0) -> None:
+        """Re-enqueue a job into its priority lane, optionally after a delay."""
+        if delay_seconds > 0:
+            asyncio.create_task(self._re_enqueue_after_delay(job_data, delay_seconds))
+            logger.info(
+                "Job %s scheduled for re-enqueue in %ss",
+                job_data.get("id"),
+                delay_seconds,
+            )
+            return
+
+        await self._enqueue_job_data(job_data)
+
+    async def _re_enqueue_after_delay(self, job_data: dict, delay_seconds: int) -> None:
+        """Wait before re-enqueuing a deferred job."""
+        await asyncio.sleep(delay_seconds)
+        await self._enqueue_job_data(job_data)
+
+    async def _enqueue_job_data(self, job_data: dict) -> None:
+        """Push raw job data back to the queue lane derived from priority."""
+        priority_name = job_data.get("priority", Priority.MEDIUM.name)
+        try:
+            priority = Priority[priority_name]
+        except KeyError:
+            priority = Priority.MEDIUM
+
+        client = await self.queue.redis.get_client()
+        key = QueueManager._key_for_priority(priority)
+        await client.lpush(key, json.dumps(job_data))
+        logger.info("Re-enqueued job %s into %s", job_data.get("id"), key)
+
     
     async def _execute_job(self, job_data: dict) -> None:
         """Acquire a distributed lock, execute the job, release the lock."""
@@ -68,9 +101,48 @@ class Worker:
         try:
             job_type = job_data.get("type")
             job_class = JOB_REGISTRY.get(job_type)
+            job_priority = job_data.get("priority", Priority.MEDIUM.name)
 
             if job_class is None:
                 logger.error("Unknown job type: %s", job_type)
+                return
+
+            scheduler = Scheduler(
+                queue=self.queue,
+                carbon_client=CarbonClient(redis_client=self.queue.redis),
+                energy_budget=EnergyBudget(redis_client=self.queue.redis),
+            )
+            decision = await scheduler.decide(job_data)
+
+            if decision == SchedulingDecision.STOP:
+                logger.info("Decision STOP for %s, re-enqueuing", job_id)
+                await self._re_enqueue_job(job_data)
+                return
+
+            if decision == SchedulingDecision.DEFER:
+                if job_priority == Priority.LOW.name:
+                    logger.info("Decision DEFER for LOW job %s, delaying 5 minutes", job_id)
+                    await self._re_enqueue_job(job_data, delay_seconds=300)
+                else:
+                    logger.info("Decision DEFER for %s job %s, re-enqueuing", job_priority, job_id)
+                    await self._re_enqueue_job(job_data)
+                return
+
+            can_execute_now = (
+                decision == SchedulingDecision.RUN
+                or (
+                    decision == SchedulingDecision.THROTTLE
+                    and job_priority in {Priority.HIGH.name, Priority.MEDIUM.name}
+                )
+            )
+            if not can_execute_now:
+                logger.info(
+                    "Decision %s for %s priority job %s, re-enqueuing",
+                    decision,
+                    job_priority,
+                    job_id,
+                )
+                await self._re_enqueue_job(job_data)
                 return
 
             job: BaseJob = job_class(
@@ -82,7 +154,6 @@ class Worker:
             result: JobResult = await job.execute()
 
             # Track energy consumption
-            from scheduler.energy_budget import EnergyBudget
             budget = EnergyBudget(redis_client=self.queue.redis)
             await budget.add_consumption(result.co2_grams or 0.0)
         
