@@ -97,7 +97,7 @@ async def test_unknown_job_type_handled_gracefully(caplog: pytest.LogCaptureFixt
         )
 
     assert "Unknown job type" in caplog.text
-    redis_client.delete.assert_awaited_with("lock:job-1")
+    redis_client.delete.assert_any_await("lock:job-1")
 
 
 @pytest.mark.asyncio
@@ -152,7 +152,7 @@ async def test_successful_job_logs_completion(caplog: pytest.LogCaptureFixture) 
         )
 
     assert "completed" in caplog.text.lower()
-    redis_client.delete.assert_awaited_with("lock:job-1")
+    redis_client.delete.assert_any_await("lock:job-1")
 
 
 @pytest.mark.asyncio
@@ -208,7 +208,7 @@ async def test_failed_job_logs_error(caplog: pytest.LogCaptureFixture) -> None:
 
     assert "failed" in caplog.text.lower()
     redis_client.lpush.assert_not_awaited()
-    redis_client.delete.assert_awaited_with("lock:job-1")
+    redis_client.delete.assert_any_await("lock:job-1")
 
 
 @pytest.mark.asyncio
@@ -245,7 +245,7 @@ async def test_stop_decision_reenqueues_job_and_skips_execution() -> None:
     redis_client.lpush.assert_awaited_once()
     args, _ = redis_client.lpush.await_args
     assert args[0] == "queue:medium"
-    redis_client.delete.assert_awaited_with("lock:job-1")
+    redis_client.delete.assert_any_await("lock:job-1")
 
 
 @pytest.mark.asyncio
@@ -282,7 +282,7 @@ async def test_defer_low_priority_reenqueues_with_five_minute_delay() -> None:
 
     mock_create_task.assert_called_once()
     redis_client.lpush.assert_not_awaited()
-    redis_client.delete.assert_awaited_with("lock:job-1")
+    redis_client.delete.assert_any_await("lock:job-1")
 
 
 @pytest.mark.asyncio
@@ -317,5 +317,5 @@ async def test_throttle_medium_priority_executes_job() -> None:
         await worker._execute_job(job_data)
 
     redis_client.lpush.assert_not_awaited()
-    redis_client.delete.assert_awaited_with("lock:job-1")
+    redis_client.delete.assert_any_await("lock:job-1")
 

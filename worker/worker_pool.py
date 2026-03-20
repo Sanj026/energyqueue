@@ -4,6 +4,10 @@ from typing import List, Optional
 
 from broker.queue_manager import QueueManager
 from broker.redis_client import RedisClient
+from scheduler.carbon_client import CarbonClient
+from scheduler.energy_budget import EnergyBudget
+from scheduler.queue_flusher import start_flusher
+from scheduler.scheduler import Scheduler
 from worker.heartbeat import Heartbeat
 from worker.worker import Worker
 
@@ -29,6 +33,7 @@ class WorkerPool:
         self._worker_tasks: list[asyncio.Task[None]] = []
         self._heartbeat: Optional[Heartbeat] = None
         self._heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._flusher_task: Optional[asyncio.Task[None]] = None
         self._stopping = asyncio.Event()
 
     async def start(self) -> None:
@@ -49,6 +54,13 @@ class WorkerPool:
         # Single heartbeat for the pool identity.
         self._heartbeat = Heartbeat(worker_id="pool", redis_client=self.redis)
         self._heartbeat_task = asyncio.create_task(self._heartbeat.start(), name="worker-pool-heartbeat")
+
+        scheduler = Scheduler(
+            queue=self.queue,
+            carbon_client=CarbonClient(redis_client=self.redis),
+            energy_budget=EnergyBudget(redis_client=self.redis),
+        )
+        self._flusher_task = await start_flusher(scheduler, self.queue)
         await asyncio.gather(*self._worker_tasks)
         
     async def stop(self) -> None:
@@ -65,6 +77,13 @@ class WorkerPool:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._flusher_task:
+            self._flusher_task.cancel()
+            try:
+                await self._flusher_task
             except asyncio.CancelledError:
                 pass
 

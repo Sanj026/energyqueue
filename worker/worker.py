@@ -7,6 +7,7 @@ from broker.redis_client import RedisClient
 from jobs.base_job import BaseJob, JobResult
 from jobs.ml_training_job import MLTrainingJob
 from jobs.image_resize_job import ImageResizeJob
+from jobs.inference_job import InferenceJob
 from scheduler.scheduler import Scheduler, SchedulingDecision
 from scheduler.carbon_client import CarbonClient
 from scheduler.energy_budget import EnergyBudget
@@ -14,9 +15,11 @@ from worker.energy_profiler import EnergyProfiler
 
 logger = logging.getLogger(__name__)
 LOCK_TTL = 30 
+WORKER_JOB_TTL_SECONDS = 60
 JOB_REGISTRY = {
     "ml_training": MLTrainingJob,
     "image_resize": ImageResizeJob,
+    "inference": InferenceJob,
 }
 
 
@@ -83,6 +86,8 @@ class Worker:
         """Acquire a distributed lock, execute the job, release the lock."""
         job_id = job_data.get("id")
         lock_key = f"lock:{job_id}"
+        worker_job_key = f"worker_job:{self.worker_id}"
+        worker_job_data_key = f"worker_job_data:{self.worker_id}"
 
         client = await self.queue.redis.get_client()
 
@@ -150,6 +155,8 @@ class Worker:
                 payload=job_data["payload"],
             )
 
+            await client.set(worker_job_key, job_id, ex=WORKER_JOB_TTL_SECONDS)
+            await client.set(worker_job_data_key, json.dumps(job_data), ex=WORKER_JOB_TTL_SECONDS)
             logger.info("Worker %s executing job %s", self.worker_id, job.job_id)
             result: JobResult = await job.execute()
 
@@ -179,4 +186,6 @@ class Worker:
 
         finally:
             await client.delete(lock_key)
+            await client.delete(worker_job_key)
+            await client.delete(worker_job_data_key)
             logger.info("Lock released for job %s", job_id)
