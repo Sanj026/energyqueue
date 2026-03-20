@@ -4,6 +4,7 @@ from broker.queue_manager import QueueManager, Priority
 from broker.redis_client import RedisClient
 from scheduler.carbon_client import CarbonClient
 from scheduler.energy_budget import EnergyBudget
+from scheduler.energy_model import EnergyModel
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +28,12 @@ class Scheduler:
         queue: QueueManager,
         carbon_client: CarbonClient,
         energy_budget: EnergyBudget,
+        energy_model: EnergyModel | None = None,
     ):
         self.queue = queue
         self.carbon = carbon_client
         self.budget = energy_budget
+        self.energy_model = energy_model
 
     async def decide(self, job: dict) -> str:
         """Return a SchedulingDecision for the given job."""
@@ -59,6 +62,19 @@ class Scheduler:
             if job_priority == Priority.LOW.name:
                 logger.info("Grid moderate (%.0fg) — deferring LOW priority job", intensity)
                 return SchedulingDecision.DEFER
+            if self.energy_model:
+                job_type = str(job.get("type", "unknown"))
+                expensive_now = await self.energy_model.should_defer(
+                    job_type,
+                    intensity,
+                )
+                if expensive_now:
+                    logger.info(
+                        "Grid moderate (%.0fg) and %s history predicts high CO2 — deferring",
+                        intensity,
+                        job_type,
+                    )
+                    return SchedulingDecision.DEFER
             logger.info("Grid moderate (%.0fg) — throttling", intensity)
             return SchedulingDecision.THROTTLE
 

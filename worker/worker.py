@@ -11,6 +11,7 @@ from jobs.inference_job import InferenceJob
 from scheduler.scheduler import Scheduler, SchedulingDecision
 from scheduler.carbon_client import CarbonClient
 from scheduler.energy_budget import EnergyBudget
+from scheduler.energy_model import EnergyModel
 from worker.energy_profiler import EnergyProfiler
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ class Worker:
                 queue=self.queue,
                 carbon_client=CarbonClient(redis_client=self.queue.redis),
                 energy_budget=EnergyBudget(redis_client=self.queue.redis),
+                energy_model=EnergyModel(redis_client=self.queue.redis),
             )
             decision = await scheduler.decide(job_data)
 
@@ -163,6 +165,13 @@ class Worker:
             # Track energy consumption
             budget = EnergyBudget(redis_client=self.queue.redis)
             await budget.add_consumption(result.co2_grams or 0.0)
+            await EnergyModel.record_job_energy(
+                redis_client=self.queue.redis,
+                job_type=job_type,
+                kwh=result.energy_kwh or 0.0,
+                co2_grams=result.co2_grams or 0.0,
+                duration=result.duration_seconds or 0.0,
+            )
         
             # Store energy data in Redis
             await client.rpush("jobs:completed", json.dumps({

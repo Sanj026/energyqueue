@@ -19,7 +19,7 @@ from worker.worker_pool import WorkerPool
 async def main():
     r = RedisClient()
     q = QueueManager(r)
-    pool = WorkerPool(queue=q, redis=r, size=3)
+    pool = WorkerPool(queue=q, redis=r, size=5)
     await pool.start()
 
 asyncio.run(main())

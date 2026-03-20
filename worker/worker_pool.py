@@ -6,6 +6,7 @@ from broker.queue_manager import QueueManager
 from broker.redis_client import RedisClient
 from scheduler.carbon_client import CarbonClient
 from scheduler.energy_budget import EnergyBudget
+from scheduler.energy_model import EnergyModel
 from scheduler.queue_flusher import start_flusher
 from scheduler.scheduler import Scheduler
 from worker.heartbeat import Heartbeat
@@ -59,6 +60,7 @@ class WorkerPool:
             queue=self.queue,
             carbon_client=CarbonClient(redis_client=self.redis),
             energy_budget=EnergyBudget(redis_client=self.redis),
+            energy_model=EnergyModel(redis_client=self.redis),
         )
         self._flusher_task = await start_flusher(scheduler, self.queue)
         await asyncio.gather(*self._worker_tasks)
