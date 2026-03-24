@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+from datetime import datetime, UTC
 
 from broker.queue_manager import QueueManager, Priority
 from broker.redis_client import RedisClient
@@ -15,8 +16,9 @@ from scheduler.energy_model import EnergyModel
 from worker.energy_profiler import EnergyProfiler
 
 logger = logging.getLogger(__name__)
-LOCK_TTL = 30 
+LOCK_TTL = 30
 WORKER_JOB_TTL_SECONDS = 60
+EXECUTED_KEY_TTL_SECONDS = 86400
 JOB_REGISTRY = {
     "ml_training": MLTrainingJob,
     "image_resize": ImageResizeJob,
@@ -92,6 +94,21 @@ class Worker:
 
         client = await self.queue.redis.get_client()
 
+        executed_key = f"executed:{job_id}"
+        if await client.exists(executed_key):
+            logger.info("Job %s already executed — skipping duplicate", job_id)
+            return
+
+        idempotency_claimed = await client.set(
+            executed_key,
+            datetime.now(UTC).isoformat(),
+            nx=True,
+            ex=EXECUTED_KEY_TTL_SECONDS,
+        )
+        if not idempotency_claimed:
+            logger.info("Job %s already executed — skipping duplicate", job_id)
+            return
+
         # Try to acquire the lock atomically
         acquired = await client.set(
             lock_key,
@@ -101,6 +118,7 @@ class Worker:
         )
 
         if not acquired:
+            await client.delete(executed_key)
             logger.warning("Job %s already locked by another worker — skipping", job_id)
             return
 
@@ -111,6 +129,7 @@ class Worker:
 
             if job_class is None:
                 logger.error("Unknown job type: %s", job_type)
+                await client.delete(executed_key)
                 return
 
             scheduler = Scheduler(
@@ -123,15 +142,18 @@ class Worker:
 
             if decision == SchedulingDecision.STOP:
                 logger.info("Decision STOP for %s, re-enqueuing", job_id)
+                await client.delete(executed_key)
                 await self._re_enqueue_job(job_data)
                 return
 
             if decision == SchedulingDecision.DEFER:
                 if job_priority == Priority.LOW.name:
                     logger.info("Decision DEFER for LOW job %s, delaying 5 minutes", job_id)
+                    await client.delete(executed_key)
                     await self._re_enqueue_job(job_data, delay_seconds=300)
                 else:
                     logger.info("Decision DEFER for %s job %s, re-enqueuing", job_priority, job_id)
+                    await client.delete(executed_key)
                     await self._re_enqueue_job(job_data)
                 return
 
@@ -149,6 +171,7 @@ class Worker:
                     job_priority,
                     job_id,
                 )
+                await client.delete(executed_key)
                 await self._re_enqueue_job(job_data)
                 return
 

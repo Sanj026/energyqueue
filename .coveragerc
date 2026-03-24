@@ -1,0 +1,8 @@
+[run]
+omit =
+    energy_env/*
+    tests/*
+    data/*
+
+[report]
+show_missing = true

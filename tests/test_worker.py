@@ -23,6 +23,7 @@ class _FakeJob:
 def _make_mock_redis() -> tuple[MagicMock, AsyncMock]:
     redis_wrapper = MagicMock()
     redis_client = AsyncMock()
+    redis_client.exists = AsyncMock(return_value=0)
     redis_client.set = AsyncMock(return_value=True)
     redis_client.delete = AsyncMock()
     redis_client.lpush = AsyncMock()

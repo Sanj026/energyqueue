@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ ENERGY_BUDGET_CONSUMED_KEY = "energy:budget:consumed"
 DEFAULT_ENERGY_BUDGET_GRAMS = 500.0
 
 COMPLETED_JOBS_KEY = "jobs:completed"
+QUEUE_DEAD_LETTER_KEY = "queue:dead_letter"
 SCHEDULER_DECISION_LABELS = ("RUN", "DEFER", "THROTTLE", "STOP", "UNKNOWN")
 
 
@@ -43,6 +45,7 @@ class DashboardSnapshot:
     energy_budget_total_grams: float
     scheduler_decision: str
     completed_jobs: list[str]
+    dead_letter_entries: list[str]
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -167,6 +170,12 @@ async def _fetch_snapshot(client: redis.Redis) -> DashboardSnapshot:
         logger.exception("Failed reading completed jobs list %s", COMPLETED_JOBS_KEY)
         completed = []
 
+    try:
+        dead_letter = await client.lrange(QUEUE_DEAD_LETTER_KEY, 0, -1)
+    except Exception:
+        logger.exception("Failed reading dead letter queue %s", QUEUE_DEAD_LETTER_KEY)
+        dead_letter = []
+
     if decision not in SCHEDULER_DECISION_LABELS:
         decision = "DEFER"
 
@@ -179,6 +188,7 @@ async def _fetch_snapshot(client: redis.Redis) -> DashboardSnapshot:
         energy_budget_total_grams=budget_total,
         scheduler_decision=decision,
         completed_jobs=[str(x) for x in completed],
+        dead_letter_entries=[str(x) for x in dead_letter],
     )
 
 
@@ -234,6 +244,7 @@ async def _render_once(
     budget_box: st.delta_generator.DeltaGenerator,
     decision_box: st.delta_generator.DeltaGenerator,
     completed_box: st.delta_generator.DeltaGenerator,
+    dead_letter_box: st.delta_generator.DeltaGenerator,
 ) -> None:
     """Render one dashboard frame into pre-allocated containers."""
     try:
@@ -345,6 +356,47 @@ async def _render_once(
         else:
             st.code("\n".join(snapshot.completed_jobs))
 
+    with dead_letter_box.container():
+        st.subheader("6) Dead Letter Queue")
+        entries = snapshot.dead_letter_entries
+        if not entries:
+            st.markdown(
+                "<span style='color:green;font-weight:600;'>✅ No failed jobs</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            n = len(entries)
+            st.markdown(
+                f"<span style='color:red;font-weight:600;'>⚠️ {n} jobs in dead letter queue</span>",
+                unsafe_allow_html=True,
+            )
+            rows: list[dict[str, str]] = []
+            for raw in entries:
+                try:
+                    obj = json.loads(raw)
+                    if not isinstance(obj, dict):
+                        raise ValueError("dead letter entry is not a JSON object")
+                    rows.append(
+                        {
+                            "job_id": str(obj.get("job_id", "")),
+                            "type": str(obj.get("type", "")),
+                            "dead_letter_reason": str(obj.get("dead_letter_reason", "")),
+                            "dead_letter_at": str(obj.get("dead_letter_at", "")),
+                        }
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    logger.warning("Dead letter entry JSON parse failed: %s", exc)
+                    preview = raw if len(raw) <= 200 else f"{raw[:200]}…"
+                    rows.append(
+                        {
+                            "job_id": "(parse error)",
+                            "type": "—",
+                            "dead_letter_reason": preview,
+                            "dead_letter_at": "—",
+                        }
+                    )
+            st.dataframe(rows, use_container_width=True)
+
 
 async def _dashboard_loop() -> None:
     """Main Streamlit loop: periodically re-render into placeholders."""
@@ -358,6 +410,7 @@ async def _dashboard_loop() -> None:
     with col_left:
         queue_box = st.empty()
         completed_box = st.empty()
+        dead_letter_box = st.empty()
 
     with col_right:
         carbon_box = st.empty()
@@ -373,6 +426,7 @@ async def _dashboard_loop() -> None:
             budget_box=budget_box,
             decision_box=decision_box,
             completed_box=completed_box,
+            dead_letter_box=dead_letter_box,
         )
         await asyncio.sleep(REFRESH_SECONDS)
 

@@ -27,4 +27,4 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest tests/ -v --timeout=10
+          pytest tests/ -v --timeout=10 --cov=. --cov-report=term-missing --cov-report=xml
