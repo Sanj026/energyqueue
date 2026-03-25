@@ -1,3 +1,13 @@
+![CI](https://github.com/Sanj026/energyqueue/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+## Install
+```bash
+pip install energyqueue
+```
+> PyPI publish coming soon. For now clone and run locally — see Quick Start below.
+
 ### EnergyQueue — carbon-aware distributed task queue for ML training
 
 ---
@@ -26,6 +36,8 @@ EnergyQueue addresses this by:
 ---
 
 ### 3. Architecture overview
+
+![Architecture](docs/architecture.png)
 
 At a high level, EnergyQueue consists of:
 
@@ -76,7 +88,7 @@ At a high level, EnergyQueue consists of:
 
 ```bash
 # 1) Clone the repository
-git clone https://github.com/<your-username>/energyqueue.git
+git clone https://github.com/Sanj026/energyqueue
 cd energyqueue
 
 # 2) Create local env file
@@ -91,6 +103,26 @@ Then:
 
 - Streamlit dashboard: typically at `http://localhost:8501`
 - Redis: `redis://localhost:6379` (or as configured in `.env`)
+
+---
+
+## Benchmark Results
+Run on MacBook Air M-series · Python 3.11 · 3 concurrent async workers · Live UK grid (GB zone)
+
+| Metric | Value |
+|---|---|
+| Jobs submitted | 50 |
+| Jobs completed | 48 |
+| Jobs to dead letter | 2 (fault tolerance verified) |
+| Total processing time | 160.77s |
+| End-to-end throughput | 0.30 jobs/sec |
+| Redis enqueue rate | 3,459 jobs/sec |
+| Avg job execution time | 3.35s |
+| CO₂ tracked | 76.65g across 48 jobs |
+| CO₂ per job | 1.60g |
+| Grid carbon intensity | 143 gCO₂/kWh (live UK grid) |
+
+> **Note:** 0.30 jobs/sec is end-to-end including real PyTorch CIFAR-10 training (~5s per job). The 3,459 jobs/sec is raw Redis enqueue speed — the broker is not the bottleneck.
 
 ---
 

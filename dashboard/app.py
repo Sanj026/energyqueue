@@ -2,17 +2,23 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import altair as alt
 import redis.asyncio as redis
 import requests
 import streamlit as st
+from streamlit import fragment
 
 from dotenv import load_dotenv
 
-load_dotenv()
+st.set_page_config(layout="wide")
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +168,8 @@ async def _fetch_snapshot(client: redis.Redis) -> DashboardSnapshot:
     consumed_grams = float(consumed) if consumed is not None else 0.0
     budget_exhausted = consumed_grams >= budget_total
 
-    decision = "UNKNOWN"
-
     try:
-        completed = await client.lrange(COMPLETED_JOBS_KEY, -10, -1)
+        completed = await client.lrange("jobs:completed", 0, 9)
     except Exception:
         logger.exception("Failed reading completed jobs list %s", COMPLETED_JOBS_KEY)
         completed = []
@@ -176,8 +180,11 @@ async def _fetch_snapshot(client: redis.Redis) -> DashboardSnapshot:
         logger.exception("Failed reading dead letter queue %s", QUEUE_DEAD_LETTER_KEY)
         dead_letter = []
 
-    if decision not in SCHEDULER_DECISION_LABELS:
-        decision = "DEFER"
+    decision = _scheduler_decision(
+        carbon_intensity=carbon_intensity,
+        carbon_threshold=carbon_threshold,
+        budget_exhausted=budget_exhausted,
+    )
 
     return DashboardSnapshot(
         queue_depth_high=int(queue_high),
@@ -247,6 +254,7 @@ async def _render_once(
     dead_letter_box: st.delta_generator.DeltaGenerator,
 ) -> None:
     """Render one dashboard frame into pre-allocated containers."""
+    render_static = not st.session_state.get("dashboard_static_rendered", False)
     try:
         client = await _connect_redis(redis_url)
     except Exception:
@@ -277,16 +285,17 @@ async def _render_once(
         decision = "DEFER"
 
     with header_box.container():
-        st.markdown(
-            "<div style='display:flex;justify-content:space-between;align-items:flex-end;'>"
-            "<div>"
-            "<h2 style='margin-bottom:0;'>EnergyQueue Operations Console</h2>"
-            "<p style='margin-top:4px;color:gray;'>Carbon-aware task queue — live grid & energy telemetry.</p>"
-            "</div>"
-            f"<div style='font-size:12px;color:gray;'>Auto-refresh: {REFRESH_SECONDS}s</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        if render_static:
+            st.markdown(
+                "<div style='display:flex;justify-content:space-between;align-items:flex-end;'>"
+                "<div>"
+                "<h2 style='margin-bottom:0;'>EnergyQueue Operations Console</h2>"
+                "<p style='margin-top:4px;color:gray;'>Carbon-aware task queue — live grid & energy telemetry.</p>"
+                "</div>"
+                f"<div style='font-size:12px;color:gray;'>Auto-refresh: {REFRESH_SECONDS}s</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
         total_queued = (
             snapshot.queue_depth_high + snapshot.queue_depth_medium + snapshot.queue_depth_low
         )
@@ -310,21 +319,201 @@ async def _render_once(
         st.caption("HIGH = urgent jobs, MEDIUM = normal, LOW = background tasks")
 
     with carbon_box.container():
-        st.subheader("2) Current carbon intensity (GB)")
+        if render_static:
+            st.subheader("2) Current carbon intensity (GB)")
         intensity = live_intensity
         color = _carbon_color(intensity)
         label = "N/A" if intensity is None else f"{intensity:.0f} gCO₂/kWh"
-        st.metric(label="Carbon intensity", value=label)
         st.markdown(
             f"<div style='margin-top:6px;font-weight:700;color:{color};'>"
             f"Status: {color.upper()}"
             "</div>",
             unsafe_allow_html=True,
         )
+        if render_static:
+            st.markdown(
+                "🟢 **GREEN < 150g** — grid is clean, all jobs run  \n"
+                "🟡 **ORANGE 150–250g** — grid is moderate, LOW jobs deferred  \n"
+                "🔴 **RED > 250g** — grid is dirty, only HIGH jobs run",
+            )
+
+    with budget_box.container():
+        st.subheader("3) Energy budget")
+        consumed = snapshot.energy_consumed_grams
+        total = snapshot.energy_budget_total_grams
+        pct = 0.0 if total <= 0 else min(1.0, consumed / total)
+        st.progress(pct)
+        st.caption(f"{consumed:.1f} gCO₂ used / {total:.1f} gCO₂ total")
+        st.caption(
+            "Session budget: 500g CO₂ total. Equivalent to ~2.5km driven in a petrol car."
+        )
+
+    with decision_box.container():
+        if render_static:
+            st.subheader("4) Scheduler decision")
+        st.markdown(_decision_badge(decision), unsafe_allow_html=True)
+        if render_static:
+            st.caption("Derived from carbon intensity + remaining budget.")
+            st.markdown(
+                "RUN = grid clean, all jobs processing normally  \n"
+                "DEFER = grid too dirty, jobs waiting for cleaner energy  \n"
+                "THROTTLE = grid moderate, low priority jobs paused  \n"
+                "STOP = energy budget exhausted for this session",
+            )
+
+    with completed_box.container():
+        st.subheader("5) Last 10 completed jobs")
+        if not snapshot.completed_jobs:
+            st.caption("No completed jobs recorded yet.")
+        else:
+            rows: list[dict[str, Any]] = []
+            for raw in snapshot.completed_jobs:
+                try:
+                    obj = json.loads(raw)
+                    if not isinstance(obj, dict):
+                        raise ValueError("completed job entry is not a JSON object")
+                    rows.append(
+                        {
+                            "job_id": str(obj.get("job_id", "")),
+                            "type": str(obj.get("type", "")),
+                            "duration": obj.get("duration"),
+                            "co2_grams": obj.get("co2_grams"),
+                            "energy_kwh": obj.get("energy_kwh"),
+                        }
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    logger.warning("Completed job entry JSON parse failed: %s", exc)
+                    rows.append(
+                        {
+                            "job_id": "(parse error)",
+                            "type": "—",
+                            "duration": None,
+                            "co2_grams": None,
+                            "energy_kwh": None,
+                        }
+                    )
+            st.dataframe(rows, use_container_width=True)
+
+    with dead_letter_box.container():
+        st.subheader("6) Dead Letter Queue")
+        entries = snapshot.dead_letter_entries
+        if not entries:
+            st.markdown(
+                "<span style='color:green;font-weight:600;'>✅ No failed jobs</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            n = len(entries)
+            st.markdown(
+                f"<span style='color:red;font-weight:600;'>⚠️ {n} jobs in dead letter queue</span>",
+                unsafe_allow_html=True,
+            )
+            rows: list[dict[str, str]] = []
+            for raw in entries:
+                try:
+                    obj = json.loads(raw)
+                    if not isinstance(obj, dict):
+                        raise ValueError("dead letter entry is not a JSON object")
+                    rows.append(
+                        {
+                            "job_id": str(obj.get("job_id", "")),
+                            "type": str(obj.get("type", "")),
+                            "dead_letter_reason": str(obj.get("dead_letter_reason", "")),
+                            "dead_letter_at": str(obj.get("dead_letter_at", "")),
+                        }
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    logger.warning("Dead letter entry JSON parse failed: %s", exc)
+                    preview = raw if len(raw) <= 200 else f"{raw[:200]}…"
+                    rows.append(
+                        {
+                            "job_id": "(parse error)",
+                            "type": "—",
+                            "dead_letter_reason": preview,
+                            "dead_letter_at": "—",
+                        }
+                    )
+            st.dataframe(rows, use_container_width=True)
+
+    if render_static:
+        st.session_state["dashboard_static_rendered"] = True
+
+
+async def _render_live_data_once(
+    *,
+    redis_url: str,
+    metrics_box: st.delta_generator.DeltaGenerator,
+    queue_box: st.delta_generator.DeltaGenerator,
+    carbon_box: st.delta_generator.DeltaGenerator,
+    budget_box: st.delta_generator.DeltaGenerator,
+    decision_box: st.delta_generator.DeltaGenerator,
+    completed_box: st.delta_generator.DeltaGenerator,
+    dead_letter_box: st.delta_generator.DeltaGenerator,
+) -> None:
+    """Render only the live (data) sections inside a fragment."""
+    try:
+        client = await _connect_redis(redis_url)
+    except Exception:
+        logger.exception("Redis connection failed")
+        return
+
+    try:
+        snapshot = await _fetch_snapshot(client)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            logger.exception("Failed closing Redis client")
+
+    live_intensity = await _fetch_live_carbon_intensity()
+
+    budget_exhausted = snapshot.energy_consumed_grams >= snapshot.energy_budget_total_grams
+    if budget_exhausted:
+        decision = "STOP"
+    elif live_intensity is None:
+        decision = "UNKNOWN"
+    elif live_intensity < 150:
+        decision = "RUN"
+    elif live_intensity < 250:
+        decision = "THROTTLE"
+    else:
+        decision = "DEFER"
+
+    with metrics_box.container():
+        total_queued = (
+            snapshot.queue_depth_high + snapshot.queue_depth_medium + snapshot.queue_depth_low
+        )
+        budget_used_pct = (
+            0.0
+            if snapshot.energy_budget_total_grams <= 0
+            else min(
+                100.0,
+                (snapshot.energy_consumed_grams / snapshot.energy_budget_total_grams) * 100.0,
+            )
+        )
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Queued jobs (all lanes)", value=total_queued)
+        with col_b:
+            label = "N/A" if live_intensity is None else f"{live_intensity:.0f} gCO₂/kWh"
+            st.metric("Live carbon intensity", value=label)
+        with col_c:
+            st.metric("Energy budget used", value=f"{budget_used_pct:.1f}%")
+
+    with queue_box.container():
+        st.subheader("1) Queue depth")
+        st.altair_chart(_queue_depth_chart(snapshot), use_container_width=True)
+        st.caption("HIGH = urgent jobs, MEDIUM = normal, LOW = background tasks")
+
+    with carbon_box.container():
+        st.subheader("2) Current carbon intensity (GB)")
+        intensity = live_intensity
+        color = _carbon_color(intensity)
         st.markdown(
-            "🟢 **GREEN < 150g** — grid is clean, all jobs run  \n"
-            "🟡 **ORANGE 150–250g** — grid is moderate, LOW jobs deferred  \n"
-            "🔴 **RED > 250g** — grid is dirty, only HIGH jobs run",
+            f"<div style='margin-top:6px;font-weight:700;color:{color};'>"
+            f"Status: {color.upper()}"
+            "</div>",
+            unsafe_allow_html=True,
         )
 
     with budget_box.container():
@@ -342,19 +531,39 @@ async def _render_once(
         st.subheader("4) Scheduler decision")
         st.markdown(_decision_badge(decision), unsafe_allow_html=True)
         st.caption("Derived from carbon intensity + remaining budget.")
-        st.markdown(
-            "RUN = grid clean, all jobs processing normally  \n"
-            "DEFER = grid too dirty, jobs waiting for cleaner energy  \n"
-            "THROTTLE = grid moderate, low priority jobs paused  \n"
-            "STOP = energy budget exhausted for this session",
-        )
 
     with completed_box.container():
         st.subheader("5) Last 10 completed jobs")
         if not snapshot.completed_jobs:
             st.caption("No completed jobs recorded yet.")
         else:
-            st.code("\n".join(snapshot.completed_jobs))
+            rows: list[dict[str, Any]] = []
+            for raw in snapshot.completed_jobs:
+                try:
+                    obj = json.loads(raw)
+                    if not isinstance(obj, dict):
+                        raise ValueError("completed job entry is not a JSON object")
+                    rows.append(
+                        {
+                            "job_id": str(obj.get("job_id", "")),
+                            "type": str(obj.get("type", "")),
+                            "duration": obj.get("duration"),
+                            "co2_grams": obj.get("co2_grams"),
+                            "energy_kwh": obj.get("energy_kwh"),
+                        }
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    logger.warning("Completed job entry JSON parse failed: %s", exc)
+                    rows.append(
+                        {
+                            "job_id": "(parse error)",
+                            "type": "—",
+                            "duration": None,
+                            "co2_grams": None,
+                            "energy_kwh": None,
+                        }
+                    )
+            st.dataframe(rows, use_container_width=True)
 
     with dead_letter_box.container():
         st.subheader("6) Dead Letter Queue")
@@ -398,13 +607,24 @@ async def _render_once(
             st.dataframe(rows, use_container_width=True)
 
 
-async def _dashboard_loop() -> None:
-    """Main Streamlit loop: periodically re-render into placeholders."""
-    st.set_page_config(page_title="EnergyQueue Dashboard", layout="wide")
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-    header_box = st.empty()
+    # Static header (render once).
+    st.markdown(
+        "<div style='display:flex;justify-content:space-between;align-items:flex-end;'>"
+        "<div>"
+        "<h2 style='margin-bottom:0;'>EnergyQueue Operations Console</h2>"
+        "<p style='margin-top:4px;color:gray;'>Carbon-aware task queue — live grid & energy telemetry.</p>"
+        "</div>"
+        f"<div style='font-size:12px;color:gray;'>Auto-refresh: {REFRESH_SECONDS}s</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    metrics_box = st.empty()
     col_left, col_right = st.columns(2)
 
     with col_left:
@@ -414,27 +634,42 @@ async def _dashboard_loop() -> None:
 
     with col_right:
         carbon_box = st.empty()
+        carbon_legend_box = st.empty()
         budget_box = st.empty()
         decision_box = st.empty()
+        decision_legend_box = st.empty()
 
-    while True:
-        await _render_once(
-            redis_url=redis_url,
-            header_box=header_box,
-            queue_box=queue_box,
-            carbon_box=carbon_box,
-            budget_box=budget_box,
-            decision_box=decision_box,
-            completed_box=completed_box,
-            dead_letter_box=dead_letter_box,
+    with carbon_legend_box:
+        st.markdown(
+            "🟢 **GREEN < 150g** — grid is clean, all jobs run  \n"
+            "🟡 **ORANGE 150–250g** — grid is moderate, LOW jobs deferred  \n"
+            "🔴 **RED > 250g** — grid is dirty, only HIGH jobs run",
         )
-        await asyncio.sleep(REFRESH_SECONDS)
 
+    with decision_legend_box:
+        st.markdown(
+            "RUN = grid clean, all jobs processing normally  \n"
+            "DEFER = grid too dirty, jobs waiting for cleaner energy  \n"
+            "THROTTLE = grid moderate, low priority jobs paused  \n"
+            "STOP = energy budget exhausted for this session",
+        )
 
-def main() -> None:
-    """Entry point for `streamlit run dashboard/app.py`."""
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_dashboard_loop())
+    @fragment(run_every=5)
+    def render_live_data() -> None:
+        asyncio.run(
+            _render_live_data_once(
+                redis_url=redis_url,
+                metrics_box=metrics_box,
+                queue_box=queue_box,
+                carbon_box=carbon_box,
+                budget_box=budget_box,
+                decision_box=decision_box,
+                completed_box=completed_box,
+                dead_letter_box=dead_letter_box,
+            )
+        )
+
+    render_live_data()
 
 
 if __name__ == "__main__":

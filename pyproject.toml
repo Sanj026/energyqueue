@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "energyqueue"
+version = "0.1.0"
+description = "A carbon-aware distributed task queue that schedules ML training jobs based on real-time grid carbon intensity"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["task-queue", "carbon-aware", "machine-learning", "redis", "asyncio"]
+authors = [{name = "Sanj026"}]
+
+[project.urls]
+"Homepage" = "https://github.com/Sanj026/energyqueue"
